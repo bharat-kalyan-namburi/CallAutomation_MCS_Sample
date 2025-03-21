@@ -21,7 +21,6 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var client = new CallAutomationClient("ACS_CONNECTION_STRING");
-
 var baseUri = Environment.GetEnvironmentVariable("VS_TUNNEL_URL")?.TrimEnd('/');
 var baseWssUri = baseUri.Split("https://")[1];
 
@@ -94,7 +93,6 @@ app.MapPost("/api/incomingCall", async (
 app.MapPost("/api/calls/{contextId}", async (
     [FromBody] CloudEvent[] cloudEvents,
     [FromRoute] string contextId,
-    [Required] string callerId,
     ILogger<Program> logger) =>
 {
     foreach (var cloudEvent in cloudEvents)
@@ -125,7 +123,7 @@ app.MapPost("/api/calls/{contextId}", async (
 
             // Start listening for bot responses asynchronously
             var cts = new CancellationTokenSource();
-            Task.Run(() => ListenToBotWebSocketAsync(conversation.StreamUrl, callMedia, callerId, cts.Token));
+            Task.Run(() => ListenToBotWebSocketAsync(conversation.StreamUrl, callMedia, cts.Token));
 
             await SendMessageAsync(conversationId, "Hi");
         }
@@ -283,7 +281,7 @@ async Task<Conversation> StartConversationAsync()
 }
 
 
-async Task ListenToBotWebSocketAsync(string streamUrl, CallMedia callConnectionMedia, string callerId, CancellationToken cancellationToken)
+async Task ListenToBotWebSocketAsync(string streamUrl, CallMedia callConnectionMedia, CancellationToken cancellationToken)
 {
     if (string.IsNullOrEmpty(streamUrl))
     {
