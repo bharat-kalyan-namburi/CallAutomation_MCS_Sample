@@ -21,6 +21,11 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var client = new CallAutomationClient("ACS_CONNECTION_STRING");
+string directLineSecret = "DIRECT_LINE_SECRET";
+HttpClient httpClient = new HttpClient();
+httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", directLineSecret);
+
+
 var baseUri = Environment.GetEnvironmentVariable("VS_TUNNEL_URL")?.TrimEnd('/');
 var baseWssUri = baseUri.Split("https://")[1];
 
@@ -28,10 +33,6 @@ if (string.IsNullOrEmpty(baseUri))
 {
     baseUri = builder.Configuration["BaseUri"];
 }
-
-string directLineSecret = "DIRECT_LINE_SECRET";
-HttpClient httpClient = new HttpClient();
-httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", directLineSecret);
 
 ConcurrentDictionary<string, CallContext> CallStore = new();
 
