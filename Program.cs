@@ -4,7 +4,6 @@ using Azure.Messaging.EventGrid;
 using Azure.Messaging.EventGrid.SystemEvents;
 using Microsoft.AspNetCore.Mvc;
 using Newtonsoft.Json;
-using System.ComponentModel.DataAnnotations;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -13,6 +12,7 @@ using JsonException = Newtonsoft.Json.JsonException;
 using System.Net.Http.Headers;
 using CallAutomation_MCS_Sample;
 using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -20,11 +20,28 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-var client = new CallAutomationClient("ACS_CONNECTION_STRING");
-string directLineSecret = "DIRECT_LINE_SECRET";
+//Get ACS Connection String from appsettings.json
+var acsConnectionString = builder.Configuration.GetValue<string>("AcsConnectionString");
+ArgumentNullException.ThrowIfNullOrEmpty(acsConnectionString);
+
+//Call Automation Client
+var client = new CallAutomationClient(connectionString: acsConnectionString);
+
+//Get the Cognitive Services endpoint from appsettings.json
+var cognitiveServicesEndpoint = builder.Configuration.GetValue<string>("CognitiveServiceEndpoint");
+ArgumentNullException.ThrowIfNullOrEmpty(cognitiveServicesEndpoint);
+
+//Get Agent Phone number from appsettings.json
+var agentPhonenumber = builder.Configuration.GetValue<string>("AgentPhoneNumber");
+ArgumentNullException.ThrowIfNullOrEmpty(agentPhonenumber);
+
+// Get Direct Line Secret from appsettings.json
+var directLineSecret = builder.Configuration.GetValue<string>("DirectLineSecret");
+ArgumentNullException.ThrowIfNullOrEmpty(directLineSecret);
+
+// Create an HTTP client to communicate with the Direct Line service
 HttpClient httpClient = new HttpClient();
 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", directLineSecret);
-
 
 var baseUri = Environment.GetEnvironmentVariable("VS_TUNNEL_URL")?.TrimEnd('/');
 var baseWssUri = baseUri.Split("https://")[1];
@@ -38,7 +55,7 @@ ConcurrentDictionary<string, CallContext> CallStore = new();
 
 var app = builder.Build();
 
-app.MapGet("/", () => "Hello ACS CallAutomation!");
+app.MapGet("/", () => "Hello ACS CallAutomation - MCS Sample!");
 
 app.MapPost("/api/incomingCall", async (
     [FromBody] EventGridEvent[] eventGridEvents,
@@ -68,7 +85,7 @@ app.MapPost("/api/incomingCall", async (
         {
             CallIntelligenceOptions = new CallIntelligenceOptions()
             {
-                CognitiveServicesEndpoint = new Uri("https://acs-media-cogsv-west-us-test.cognitiveservices.azure.com/")
+                CognitiveServicesEndpoint = new Uri(cognitiveServicesEndpoint)
             },
             TranscriptionOptions = new TranscriptionOptions(new Uri($"wss://{baseWssUri}/ws"), "en-US", true, TranscriptionTransport.Websocket)
             {
@@ -79,14 +96,22 @@ app.MapPost("/api/incomingCall", async (
         try
         {
             AnswerCallResult answerCallResult = await client.AnswerCallAsync(answerCallOptions);
-            logger.LogInformation($"Correlation Id: {answerCallResult?.CallConnectionProperties.CorrelationId}");
-            CallStore[answerCallResult?.CallConnectionProperties.CorrelationId] = new CallContext() { CorrelationId = answerCallResult?.CallConnectionProperties.CorrelationId };
+
+            var correlationId = answerCallResult?.CallConnectionProperties.CorrelationId;
+            logger.LogInformation($"Correlation Id: {correlationId}");
+
+            if (correlationId != null)
+            {
+                CallStore[correlationId] = new CallContext()
+                {
+                    CorrelationId = correlationId
+                };
+            }
         }
         catch (Exception ex)
         {
             logger.LogError($"Answer call exeception : {ex.StackTrace}");
         }
-
     }
     return Results.Ok();
 });
@@ -124,7 +149,7 @@ app.MapPost("/api/calls/{contextId}", async (
 
             // Start listening for bot responses asynchronously
             var cts = new CancellationTokenSource();
-            Task.Run(() => ListenToBotWebSocketAsync(conversation.StreamUrl, callMedia, cts.Token));
+            Task.Run(() => ListenToBotWebSocketAsync(conversation.StreamUrl, callConnection, cts.Token));
 
             await SendMessageAsync(conversationId, "Hi");
         }
@@ -146,13 +171,13 @@ app.MapPost("/api/calls/{contextId}", async (
 
         if (@event is TranscriptionStopped transcriptionStopped)
         {
-            app.Logger.LogInformation($"Transcription stopped: {transcriptionStopped.OperationContext}");
+            logger.LogInformation($"Transcription stopped: {transcriptionStopped.OperationContext}");
         }
         
         if(@event is CallDisconnected callDisconnected)
         {
             logger.LogInformation("Call Disconnected");
-            CallStore.TryRemove(@event.CorrelationId, out CallContext context);
+            _ = CallStore.TryRemove(@event.CorrelationId, out CallContext context);
 
         }
     }
@@ -184,7 +209,7 @@ app.Use(async (context, next) =>
                 while (webSocket.State == WebSocketState.Open || webSocket.State == WebSocketState.CloseSent)
                 {
                     byte[] receiveBuffer = new byte[4096];
-                    var cancellationToken = new CancellationTokenSource(TimeSpan.FromSeconds(120)).Token;
+                    var cancellationToken = new CancellationTokenSource(TimeSpan.FromSeconds(1200)).Token;
                     WebSocketReceiveResult receiveResult = await webSocket.ReceiveAsync(new ArraySegment<byte>(receiveBuffer), cancellationToken);
 
                     if (receiveResult.MessageType != WebSocketMessageType.Close)
@@ -281,12 +306,11 @@ async Task<Conversation> StartConversationAsync()
     return JsonConvert.DeserializeObject<Conversation>(content);
 }
 
-
-async Task ListenToBotWebSocketAsync(string streamUrl, CallMedia callConnectionMedia, CancellationToken cancellationToken)
+async Task ListenToBotWebSocketAsync(string streamUrl, CallConnection callConnection, CancellationToken cancellationToken)
 {
     if (string.IsNullOrEmpty(streamUrl))
     {
-        Console.WriteLine("WebSocket streaming is not enabled for this bot.");
+        Console.WriteLine("WebSocket streaming is not enabled for this MCS bot.");
         return;
     }
 
@@ -311,12 +335,17 @@ async Task ListenToBotWebSocketAsync(string streamUrl, CallMedia callConnectionM
                 } while (!result.EndOfMessage); // Continue until we've received the full message
 
                 string rawMessage = messageBuilder.ToString();
-                string botResponse = ExtractLatestBotMessage(rawMessage);
+                var botActivity = ExtractLatestBotActivity(rawMessage);
 
-                if (!string.IsNullOrEmpty(botResponse))
+                if (botActivity.Type == "message")
                 {
-                    Console.WriteLine($"\nPlaying Bot Response: {botResponse}\n");
-                    await PlayToAllAsync(callConnectionMedia, botResponse);
+                    Console.WriteLine($"\nPlaying Bot Response: {botActivity.Text}\n");
+                    await PlayToAllAsync(callConnection.GetCallMedia(), botActivity.Text);
+                }
+                else if (botActivity.Type == "endOfConversation")
+                {
+                    Console.WriteLine($"\nEnd of Conversation\n");
+                    await callConnection.HangUpAsync(true);
                 }
             }
         }
@@ -350,11 +379,13 @@ async Task SendMessageAsync(string conversationId, string message)
 }
 
 
-static string ExtractLatestBotMessage(string rawMessage)
+static BotActivity ExtractLatestBotActivity(string rawMessage)
 {
     try
     {
         using var doc = JsonDocument.Parse(rawMessage);
+
+        Console.WriteLine($"Raw Message: {rawMessage}");
 
         if (doc.RootElement.TryGetProperty("activities", out var activities) && activities.ValueKind == JsonValueKind.Array)
         {
@@ -362,25 +393,43 @@ static string ExtractLatestBotMessage(string rawMessage)
             for (int i = activities.GetArrayLength() - 1; i >= 0; i--)
             {
                 var activity = activities[i];
-                //Console.WriteLine($"Voice content: {activity}");
 
-                if (activity.TryGetProperty("type", out var type) && type.GetString() == "message")
+                if (activity.TryGetProperty("type", out var type))
                 {
-                    if (activity.TryGetProperty("from", out var from) &&
-                        from.TryGetProperty("id", out var fromId) &&
-                        fromId.GetString() != "user1") // Ensure message is from bot
+                    if (type.GetString() == "message")
                     {
-                        if (activity.TryGetProperty("speak", out var speak))
+                        if (activity.TryGetProperty("from", out var from) &&
+                            from.TryGetProperty("id", out var fromId) &&
+                            fromId.GetString() != "user1") // Ensure message is from bot
                         {
-                            //Console.WriteLine($"Voice content: {speak}");
-                            return speak.GetString();
-                        }
+                            if (activity.TryGetProperty("speak", out var speak))
+                            {
+                                //Console.WriteLine($"Voice content: {speak}");
+                                return new BotActivity()
+                                {
+                                    Type = "message",
+                                    Text = RemoveReferences(speak.GetString())
+                                };
+                            }
 
-                        if (activity.TryGetProperty("text", out var text))
-                        {
-                            return text.GetString();
+                            if (activity.TryGetProperty("text", out var text))
+                            {
+                                return new BotActivity()
+                                {
+                                    Type = "message",
+                                    Text = RemoveReferences(text.GetString())
+                                };
+                            }
                         }
                     }
+                    else if(type.GetString() == "endOfConversation")
+                    {
+                        return new BotActivity()
+                        {
+                            Type = "endOfConversation"
+                        };
+                    }
+
                 }
             }
         }
@@ -388,28 +437,36 @@ static string ExtractLatestBotMessage(string rawMessage)
     catch (JsonException)
     {
         Console.WriteLine("Warning: Received unexpected JSON format.");
-        return rawMessage; // If parsing fails, return the raw text
     }
-    return string.Empty;
+    return new BotActivity()
+        {
+            Type = "Error",
+            Text = "Sorry, Something went wrong"
+        };
+}
 
+static string RemoveReferences(string input)
+{
+    // Remove inline references like [1], [2], etc.
+    string withoutInlineRefs = Regex.Replace(input, @"\[\d+\]", "");
+
+    // Remove reference list at the end (lines starting with [number]:)
+    string withoutRefList = Regex.Replace(withoutInlineRefs, @"\n\[\d+\]:.*(\n|$)", "");
+
+    return withoutRefList.Trim();
 }
 
 async Task PlayToAllAsync(CallMedia callConnectionMedia, string message)
  {
-    // Play greeting message
-    var greetingPlaySource = new TextSource(message)
-    {
-        VoiceName = "en-US-NancyNeural"
-    };
+    var ssmlPlaySource = new SsmlSource($"<speak version=\"1.0\" xmlns=\"http://www.w3.org/2001/10/synthesis\" xml:lang=\"en-US\"><voice name=\"en-US-NancyNeural\">{message}</voice></speak>");
 
-    var playOptions = new PlayToAllOptions(greetingPlaySource)
+    var playOptions = new PlayToAllOptions(ssmlPlaySource)
     {
         OperationContext = "Testing"
     };
 
     await callConnectionMedia.PlayToAllAsync(playOptions);
  }
-
 
 
 // Configure the HTTP request pipeline.
