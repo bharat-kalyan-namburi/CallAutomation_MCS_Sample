@@ -13,6 +13,7 @@ using System.Net.Http.Headers;
 using CallAutomation_MCS_Sample;
 using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
+using Azure.Communication;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -34,6 +35,11 @@ ArgumentNullException.ThrowIfNullOrEmpty(cognitiveServicesEndpoint);
 //Get Agent Phone number from appsettings.json
 var agentPhonenumber = builder.Configuration.GetValue<string>("AgentPhoneNumber");
 ArgumentNullException.ThrowIfNullOrEmpty(agentPhonenumber);
+var agentPhoneIdentity = new PhoneNumberIdentifier(agentPhonenumber);
+
+var acsPhoneNumber = builder.Configuration.GetValue<string>("AcsPhoneNumber");
+ArgumentNullException.ThrowIfNullOrEmpty(acsPhoneNumber);
+var acsPhoneIdentity = new PhoneNumberIdentifier(acsPhoneNumber);
 
 // Get Direct Line Secret from appsettings.json
 var directLineSecret = builder.Configuration.GetValue<string>("DirectLineSecret");
@@ -347,6 +353,16 @@ async Task ListenToBotWebSocketAsync(string streamUrl, CallConnection callConnec
                     Console.WriteLine($"\nEnd of Conversation\n");
                     await callConnection.HangUpAsync(true);
                 }
+                else if (botActivity.Type == "handoff")
+                {
+                    var transferOptions = new TransferToParticipantOptions(agentPhoneIdentity)
+                    {
+                        SourceCallerIdNumber = acsPhoneIdentity
+                    };
+
+                    await Task.Delay(6000);
+                    await callConnection.TransferCallToParticipantAsync(transferOptions);
+                }
             }
         }
         catch (Exception ex)
@@ -377,7 +393,6 @@ async Task SendMessageAsync(string conversationId, string message)
     var response = await httpClient.PostAsync($"https://directline.botframework.com/v3/directline/conversations/{conversationId}/activities", content);
     response.EnsureSuccessStatusCode();
 }
-
 
 static BotActivity ExtractLatestBotActivity(string rawMessage)
 {
@@ -427,6 +442,14 @@ static BotActivity ExtractLatestBotActivity(string rawMessage)
                         return new BotActivity()
                         {
                             Type = "endOfConversation"
+                        };
+                    }
+
+                    else if(type.GetString() == "handoff")
+                    {
+                        return new BotActivity()
+                        {
+                            Type = "handoff"
                         };
                     }
 
